@@ -193,6 +193,8 @@ non-empty; the text firmware only requires the SSID.
    - `/help` lists commands.
    - `/health` checks the ESP32.
    - `/ask <question>` explicitly sends a question.
+   - `/llm [provider]` displays or sets the active LLM fallback provider.
+   - `/key <api_key>` sets the provider API key.
    - `/exit` or `/quit` exits the client only; it does not turn off the ESP32.
 
    Plain `exit` is treated like any other question.
@@ -250,6 +252,9 @@ You can also type questions directly into the serial monitor.
    | `/begin` (alias `/stream`) | Starts continuous microphone streaming with spoken answers |
    | `/record [seconds]` | Records once (default 5 s, maximum 20 s) and sends the WAV to the board |
    | `/speak <text>` | Synthesizes the text on the ESP32 and plays it on the computer |
+   | `/ask <question>` | Asks an unscripted question to the LLM and synthesizes it on the ESP32 |
+   | `/llm [provider]` | Displays or switches the active LLM provider (`gemini`, `groq`, `ollama`, `off`) |
+   | `/key <api_key>` | Sets the API key for the active provider |
    | `/help` | Lists commands |
    | `/exit` or `/quit` | Exits the client |
 
@@ -656,6 +661,17 @@ How `/begin` works:
    picked up by the microphone.
 5. If a speech download makes no progress for 10 s the client stops with an
    error. Ctrl-C stops streaming cleanly.
+
+### Optional free LLM fallback (`llm_fallback.py`)
+
+When asking questions that are not present in `data/faq.txt`:
+- In text mode (`mac_client.py`), if the question is not recognized, the client queries a free LLM for the answer.
+- In voice mode (`mac_voice_client.py`), if MultiNet does not recognize the question among the configured 192 FAQ phrases, the client sends the audio to a free multimodal LLM, then sends the resulting answer text back to the ESP32's `POST /speak` endpoint so the **ESP32 synthesizes the spoken answer using its on-board Flite engine**.
+
+Providers supported with zero extra dependencies (standard library only):
+- **Google Gemini** (default): Free tier (`gemini-2.0-flash`). Set `export GEMINI_API_KEY="your-key"`. Supports direct audio without needing an external speech-to-text engine.
+- **Groq**: Free tier (`whisper-large-v3-turbo` + `llama-3.3-70b-versatile`). Set `export GROQ_API_KEY="your-key"`.
+- **Ollama**: 100% offline local text model (`llama3.2`). Set `export OLLAMA_HOST="http://localhost:11434"`.
 
 ## Flash layout
 

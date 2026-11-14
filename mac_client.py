@@ -5,8 +5,10 @@ import argparse
 import urllib.error
 import urllib.request
 
+import llm_fallback
+
 DEFAULT_ESP32_URL = "http://172.20.10.3"
-COMMANDS = "/help, /health, /ask <question>, /exit"
+COMMANDS = "/help, /health, /ask <question>, /llm [provider], /key <key>, /exit"
 
 
 def ask_esp32(base_url: str, question: str, timeout: float) -> str:
@@ -28,7 +30,19 @@ def check_health(base_url: str, timeout: float) -> str:
 
 def send_question(base_url: str, question: str, timeout: float) -> None:
     try:
-        print(f"ESP32> {ask_esp32(base_url, question, timeout)}")
+        reply = ask_esp32(base_url, question, timeout)
+        print(f"ESP32> {reply}")
+        if (
+            reply.startswith("I don't know that one yet")
+            and llm_fallback.is_llm_available()
+        ):
+            print("ESP32> Asking LLM fallback...")
+            try:
+                llm_reply = llm_fallback.query_text(question, timeout=timeout)
+                if llm_reply:
+                    print(f"LLM> {llm_reply}")
+            except Exception as error:
+                print(f"LLM fallback failed: {error}")
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace").strip()
         print(f"ESP32 returned HTTP {error.code}: {detail}")
@@ -71,6 +85,17 @@ def handle_input(line: str, base_url: str, timeout: float) -> bool:
             send_question(base_url, argument, timeout)
         else:
             print("Usage: /ask <question>")
+    elif command == "/llm":
+        if argument:
+            llm_fallback.set_active_provider(argument)
+        print(f"LLM Provider: {llm_fallback.get_status_description()}")
+    elif command == "/key":
+        if not argument:
+            print("Usage: /key <api_key>")
+            return True
+        provider = llm_fallback.get_active_provider() or "gemini"
+        llm_fallback.set_provider_key(provider, argument)
+        print(f"Set API key for {provider}. Status: {llm_fallback.get_status_description()}")
     else:
         print(f"Unknown command: {command}. Commands: {COMMANDS}")
 
@@ -91,6 +116,7 @@ def main() -> int:
     args = parser.parse_args()
     print(f"Connected target: {args.esp32_url}")
     print(f"Commands: {COMMANDS}")
+    print(f"LLM fallback: {llm_fallback.get_status_description()}")
 
     while True:
         try:

@@ -17,6 +17,8 @@ import urllib.request
 import wave
 from urllib.parse import urlsplit
 
+import llm_fallback
+
 DEFAULT_ESP32_URL = "http://172.20.10.2"
 SAMPLE_RATE = 16000
 MAX_RECORDING_SECONDS = 20
@@ -28,7 +30,8 @@ TTS_SMOOTHING_CUTOFF_HZ = 6200.0
 TTS_COMPRESSOR_THRESHOLD = 0.55
 TTS_COMPRESSOR_RATIO = 2.0
 COMMANDS = (
-    "/help, /health, /record [seconds], /speak <text>, /mac, /esp, /begin, /exit"
+    "/help, /health, /record [seconds], /speak <text>, /ask <question>, "
+    "/llm [provider], /key <key>, /mac, /esp, /begin, /exit"
 )
 
 
@@ -328,6 +331,8 @@ def display_stream_message(message: str) -> None:
         print("ESP32> Wake word heard. Ask your question.")
     elif message == "EVENT LISTENING":
         print("ESP32> Listening for your question.")
+    elif message == "EVENT UNRECOGNIZED":
+        print("ESP32> Question was not recognized in local FAQ.")
     elif message.startswith("EVENT "):
         print(f"ESP32> {message[6:]}")
     else:
@@ -370,6 +375,38 @@ def stream_audio(
         playback_lock = threading.Lock()
         microphone_frames = MicrophoneFrameBuffer()
         audio_stall_deadline: float | None = None
+        listening_frames: list[bytes] = []
+        is_listening = False
+
+        def trigger_llm_fallback(frames: list[bytes]) -> None:
+            if not frames or not llm_fallback.is_llm_available():
+                return
+            wav_data = encode_wav(b"".join(frames), sample_rate=sample_rate)
+            print("ESP32> Question not recognized in local FAQ. Asking LLM...")
+            try:
+                llm_answer = llm_fallback.query_audio(wav_data, timeout=timeout)
+                if not llm_answer:
+                    return
+                print(f"LLM> {llm_answer}")
+                if speech_backend == "macos":
+                    with playback_lock:
+                        speaking.set()
+                        mac_speech_active.set()
+                        esp_audio_pending.set()
+                        audio_queue.put(("macos", llm_answer))
+                else:
+                    with playback_lock:
+                        speaking.set()
+                        esp_audio_pending.set()
+                    print("ESP32> Requesting speech synthesis...")
+                    tts_audio = request_speech(base_url, llm_answer[:1000], timeout)
+                    with playback_lock:
+                        audio_queue.put(("esp32", tts_audio))
+            except Exception as error:
+                print(f"LLM fallback error: {error}")
+                with playback_lock:
+                    esp_audio_pending.clear()
+                    resume_microphone_if_ready()
 
         def resume_microphone_if_ready() -> None:
             with playback_lock:
@@ -453,6 +490,10 @@ def stream_audio(
                                 "Microphone returned an unexpected audio frame size."
                             )
                         connection.sendall(audio)
+                        if is_listening:
+                            listening_frames.append(audio)
+                            if len(listening_frames) > 250:
+                                listening_frames.pop(0)
 
                     readable, _, _ = select.select(
                         [connection],
@@ -467,6 +508,22 @@ def stream_audio(
                         for kind, content in responses.feed(data):
                             if kind == "text":
                                 message = str(content)
+                                if message == "EVENT LISTENING":
+                                    is_listening = True
+                                    listening_frames.clear()
+                                elif message.startswith("Recognized:"):
+                                    is_listening = False
+                                    listening_frames.clear()
+                                elif message in {"EVENT UNRECOGNIZED", "EVENT WAKE_REQUIRED"}:
+                                    if is_listening and len(listening_frames) >= 15:
+                                        frames_snapshot = list(listening_frames)
+                                        is_listening = False
+                                        listening_frames.clear()
+                                        trigger_llm_fallback(frames_snapshot)
+                                    else:
+                                        is_listening = False
+                                        listening_frames.clear()
+
                                 if (
                                     speech_backend == "macos"
                                     and message.startswith("Answer:")
@@ -561,13 +618,36 @@ def send_recording(
         print(f"Sending {seconds:g} seconds of audio to the ESP32...")
         response = ask_by_voice(base_url, recording, timeout)
         print(f"ESP32> {response}")
-        if speech_backend == "macos":
-            answer = extract_answer(response)
-            if answer is not None:
+        answer = extract_answer(response)
+        if answer is not None:
+            if speech_backend == "macos":
                 try:
                     speak_macos(answer)
                 except (OSError, subprocess.SubprocessError) as error:
                     print(f"Could not speak with macOS offline speech: {error}")
+        else:
+            if llm_fallback.is_llm_available():
+                print("ESP32> Question not recognized in local FAQ. Asking LLM...")
+                try:
+                    llm_answer = llm_fallback.query_audio(recording, timeout=timeout)
+                    if llm_answer:
+                        print(f"LLM> {llm_answer}")
+                        if speech_backend == "macos":
+                            try:
+                                speak_macos(llm_answer)
+                            except (OSError, subprocess.SubprocessError) as error:
+                                print(f"Could not speak with macOS offline speech: {error}")
+                        else:
+                            print("ESP32> Synthesizing speech...")
+                            send_speech(base_url, llm_answer[:1000], timeout)
+                    else:
+                        print("LLM returned an empty response.")
+                except Exception as error:
+                    print(f"LLM fallback failed: {error}")
+            else:
+                print(
+                    "(Tip: Set GEMINI_API_KEY or GROQ_API_KEY to enable free cloud LLM fallback)"
+                )
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace").strip()
         print(f"ESP32 returned HTTP {error.code}: {detail}")
@@ -642,6 +722,34 @@ def handle_input(
             print("Usage: /speak <text>")
             return True
         send_speech(base_url, argument, timeout)
+    elif command == "/ask":
+        if not argument:
+            print("Usage: /ask <question>")
+            return True
+        if not llm_fallback.is_llm_available():
+            print("LLM fallback is disabled. Set GEMINI_API_KEY or GROQ_API_KEY, or use /key <key>.")
+            return True
+        print("Asking LLM...")
+        try:
+            llm_answer = llm_fallback.query_text(argument, timeout=timeout)
+            print(f"LLM> {llm_answer}")
+            if speech_settings.backend == "macos":
+                speak_macos(llm_answer)
+            else:
+                send_speech(base_url, llm_answer[:1000], timeout)
+        except Exception as error:
+            print(f"LLM request failed: {error}")
+    elif command == "/llm":
+        if argument:
+            llm_fallback.set_active_provider(argument)
+        print(f"LLM Provider: {llm_fallback.get_status_description()}")
+    elif command == "/key":
+        if not argument:
+            print("Usage: /key <api_key>")
+            return True
+        provider = llm_fallback.get_active_provider() or "gemini"
+        llm_fallback.set_provider_key(provider, argument)
+        print(f"Set API key for {provider}. Status: {llm_fallback.get_status_description()}")
     elif command in {"/begin", "/stream"}:
         try:
             stream_audio(base_url, timeout, speech_settings.backend)
@@ -672,6 +780,7 @@ def main() -> int:
     print(f"Connected target: {args.esp32_url}")
     print(f"Commands: {COMMANDS}")
     print(f"Default recording: {args.seconds:g} seconds at {SAMPLE_RATE} Hz")
+    print(f"LLM fallback: {llm_fallback.get_status_description()}")
     print("Use /begin for streaming; /mac selects Mac offline speech, /esp restores ESP32 speech.")
     speech_settings = SpeechSettings()
     while True:

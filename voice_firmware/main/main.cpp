@@ -1015,6 +1015,7 @@ void processAudioStream(int client_socket)
 
             if (command_timed_out) {
                 g_pending_samples.clear();
+                sendText(client_socket, "EVENT UNRECOGNIZED\n");
                 continue;
             }
             if (command_id < 0) {
